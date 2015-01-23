@@ -4,14 +4,20 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/ActiveState/tail"
+	"os"
 	"path/filepath"
 	"time"
 )
 
+type Output struct {
+	filename string
+	text     string
+}
+
 var (
 	outputFileName = flag.Bool("src", false, "Output source filename")
 	filesTailed    = make(map[string]bool)
+	output         = make(chan Output)
 )
 
 func isTailed(filename string) (ok bool) {
@@ -48,31 +54,64 @@ func scanFiles(firstPass bool) {
 }
 
 func tailFile(filename string, fromEnd bool) {
-	cfg := tail.Config{
-		Follow: true,
-		ReOpen: true,
-		Poll:   true,
-		Logger: tail.DiscardingLogger,
-	}
-	if fromEnd {
-		cfg.Location = &tail.SeekInfo{0, 2}
-	}
-	t, err := tail.TailFile(filename, cfg)
+	defer unsetAsTailed(filename)
+	oriInfo, err := os.Lstat(filename)
 	if err != nil {
-		fmt.Errorf("Tail file %s error: %v\n", filename, err)
-		unsetAsTailed(filename)
 		return
 	}
-	for line := range t.Lines {
-		fmt.Println(line.Text)
+	buffer := make([]byte, 65535)
+	pos := oriInfo.Size()
+	if !fromEnd {
+		pos = 0
 	}
 
-	unsetAsTailed(filename)
+	for {
+		info, err := os.Lstat(filename)
+		if err != nil {
+			return
+		}
+		if !os.SameFile(info, oriInfo) || pos > info.Size() {
+			pos = 0
+			oriInfo = info
+		}
+		if info.Size() > pos {
+			f, err := os.Open(filename)
+			if err != nil {
+				return
+			}
+			f.Seek(pos, os.SEEK_SET)
+
+			for pos < info.Size() {
+				n, err := f.Read(buffer)
+				if err != nil || n == 0 {
+					break
+				}
+				pos += int64(n)
+				output <- Output{filename, string(buffer[0:n])}
+
+			}
+			f.Close()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func doOutput() {
+	lastFilename := ""
+	for {
+		t := <-output
+		if t.filename != lastFilename {
+			lastFilename = t.filename
+			fmt.Printf("\n\n**** tail of file %s ****\n\n", lastFilename)
+		}
+		fmt.Print(t.text)
+	}
 }
 
 func main() {
 	flag.Parse()
 	firstPass := true
+	go doOutput()
 	for {
 		scanFiles(firstPass)
 		firstPass = false
